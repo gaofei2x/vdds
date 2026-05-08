@@ -5,7 +5,6 @@ set(VDDS_INCLUDE ${PROJECT_SOURCE_DIR}/include)
 
 set(VDDS_SOURCE
     Log.cpp
-    named_semaphore.cpp
     shared_memory.cpp
     vring.cpp
 )

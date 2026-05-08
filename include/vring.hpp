@@ -19,7 +19,6 @@
 
 #include "shared_memory.hpp"
 #include "dma_memory.hpp"
-#include "named_semaphore.hpp"
 
 namespace as {
 namespace vdds {
@@ -29,7 +28,7 @@ namespace vdds {
 #endif
 
 #ifndef VRING_MAX_READERS
-#define VRING_MAX_READERS 8
+#define VRING_MAX_READERS 1
 #endif
 
 #define VRING_ALIGN(sz) (((sz) + (VRING_ALIGNMENT)-1) & (~((VRING_ALIGNMENT)-1)))
@@ -54,6 +53,7 @@ namespace vdds {
 #define VRING_USED_STATE_READY 2
 #define VRING_USED_STATE_KILLED 3
 /* ================================ [ TYPES     ] ============================================== */
+
 typedef struct {
   uint32_t msgSize;
   uint32_t numDesc;
@@ -61,7 +61,7 @@ typedef struct {
 
 typedef struct {
   uint64_t timestamp; /* timestamp in microseconds when publish this DESC */
-  uint64_t handle;    /* the virtual shared large memory handle */
+  char buffer[50 * 1024 * 1024];    /* the virtual shared large memory handle */
   uint32_t len;
   int32_t spin; /* The spinlock to protect the ref and timestamp */
   int32_t ref;  /* The reference counter */
@@ -81,8 +81,6 @@ typedef struct {
 
 typedef struct {
   int32_t state;  /* atomic used state: 0 : free, 1: init, 2: ready, 3: killed */
-  uint32_t heart; /* atomic heart beat counter */
-  uint32_t lastHeart;
   uint32_t lastIdx;
   uint32_t idx;
   VRing_UsedElemType ring[];
@@ -90,7 +88,7 @@ typedef struct {
 
 class VRingBase {
 public:
-  VRingBase(std::string name, uint32_t numDesc = 8);
+  VRingBase(std::string uioId, std::string name, bool isIvshmem, uint32_t numDesc);
   ~VRingBase();
 
   uint64_t timestamp();
@@ -101,8 +99,10 @@ protected:
   void spinUnlock(int32_t *pLock);
 
 protected:
+  std::string m_uioId;
   std::string m_Name;
-  uint32_t m_NumDesc = 8;
+  bool m_isIvshmem;
+  uint32_t m_numDesc;
 
   VRing_MetaType *m_Meta = nullptr;
   VRing_DescType *m_Desc = nullptr;
@@ -115,7 +115,7 @@ protected:
 /*The Virtio Ring Writer*/
 class VRingWriter : public VRingBase {
 public:
-  VRingWriter(std::string name, uint32_t msgSize = 256 * 1024, uint32_t numDesc = 8);
+  VRingWriter(std::string uioId, std::string name, bool isIvshmem, uint32_t numDesc, uint32_t msgSize);
   ~VRingWriter();
 
   int init();
@@ -123,7 +123,7 @@ public:
   /* get an avaiable buffer from the avaiable ring
    * Positive errors: ETIMEDOUT, ENODATA
    */
-  int get(void *&buf, uint32_t &idx, uint32_t &len, uint32_t timeoutMs = 1000);
+  int get(void *&buf, uint32_t &idx, uint32_t &len);
 
   /* put the avaiable buffer to the used ring */
   int put(uint32_t idx, uint32_t len);
@@ -134,47 +134,32 @@ public:
 private:
   int setup();
   void releaseDesc(uint32_t idx);
-  void removeAbnormalReader(VRing_UsedType *used, uint32_t readerIdx);
-  void readerHeartCheck();
-  void checkDescLife();
-  void threadMain();
 
 private:
   uint32_t m_MsgSize; /* the size for each message */
   bool m_Stop = false;
   std::thread m_Thread;
 
-  std::shared_ptr<NamedSemaphore> m_SemAvail = nullptr;
-  std::vector<std::shared_ptr<NamedSemaphore>> m_UsedSems;
-
-  std::vector<std::shared_ptr<DmaMemory>> m_DmaMems;
 };
 
 class VRingReader : public VRingBase {
 public:
-  VRingReader(std::string name, uint32_t numDesc = 8);
+  VRingReader(std::string uioId, std::string name, bool isIvshmem, uint32_t numDesc);
   ~VRingReader();
 
   int init();
 
   /* get an buffer with data from the used ring
    * Positive errors: ETIMEDOUT, ENOMSG */
-  int get(void *&buf, uint32_t &idx, uint32_t &len, uint32_t timeoutMs = 1000);
+  int get(void *&buf, uint32_t &idx, uint32_t &len);
 
   /* put the buffer back to the avaiable ring */
   int put(uint32_t idx);
 
 private:
-  void threadMain();
-
-private:
   uint32_t m_ReaderIdx;
   bool m_Stop = false;
   std::thread m_Thread;
-  std::shared_ptr<NamedSemaphore> m_SemUsed = nullptr;
-  std::shared_ptr<NamedSemaphore> m_SemAvail = nullptr;
-
-  std::vector<std::shared_ptr<DmaMemory>> m_DmaMems;
 };
 /* ================================ [ DECLARES  ] ============================================== */
 /* ================================ [ DATAS     ] ============================================== */

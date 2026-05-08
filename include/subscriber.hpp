@@ -19,23 +19,21 @@ namespace vdds {
 /* ================================ [ TYPES     ] ============================================== */
 typedef struct SubscriberOptions {
 public:
-  SubscriberOptions(uint32_t queueDepth = 8) : queueDepth(queueDepth) {
-  }
-
-public:
-  uint32_t queueDepth = 8;
+  uint32_t queueDepth = 1;
+  std::string uioId;
+  std::string name;
+  bool isIvshmem = false;  // true for publisher (creates shm), false for subscriber
 } SubscriberOptions_t;
 
 template <typename T> class Subscriber {
 public:
-  Subscriber(std::string topicName,
-             const SubscriberOptions_t &subscriberOptions = SubscriberOptions());
+  Subscriber(const SubscriberOptions_t &options);
   ~Subscriber();
 
   int init();
 
-  int receive(T *&sample, uint32_t timeoutMs = 1000);
-  int receive(T *&sample, size_t &size, uint32_t timeoutMs = 1000);
+  int receive(T *&sample);
+  int receive(T *&sample, size_t &size);
 
   int release(T *sample);
 
@@ -52,8 +50,8 @@ private:
 /* ================================ [ LOCALS    ] ============================================== */
 /* ================================ [ FUNCTIONS ] ============================================== */
 template <typename T>
-Subscriber<T>::Subscriber(std::string topicName, const SubscriberOptions_t &subscriberOptions)
-  : m_TopicName(topicName), m_Reader(topicName, subscriberOptions.queueDepth) {
+Subscriber<T>::Subscriber(const SubscriberOptions_t &options)
+  :  m_Reader(options.uioId, options.name, options.isIvshmem, options.queueDepth) {
 }
 
 template <typename T> Subscriber<T>::~Subscriber() {
@@ -63,12 +61,12 @@ template <typename T> int Subscriber<T>::init() {
   return m_Reader.init();
 }
 
-template <typename T> int Subscriber<T>::receive(T *&sample, uint32_t timeoutMs) {
+template <typename T> int Subscriber<T>::receive(T *&sample) {
   int ret = 0;
   uint32_t idx;
   uint32_t len;
 
-  ret = m_Reader.get(sample, idx, len, timeoutMs);
+  ret = m_Reader.get(sample, idx, len);
   if (0 == ret) {
     std::unique_lock<std::mutex> lck(m_Mutex);
     m_IdxMap[sample] = idx;
@@ -77,12 +75,12 @@ template <typename T> int Subscriber<T>::receive(T *&sample, uint32_t timeoutMs)
   return ret;
 }
 
-template <typename T> int Subscriber<T>::receive(T *&sample, size_t &size, uint32_t timeoutMs) {
+template <typename T> int Subscriber<T>::receive(T *&sample, size_t &size) {
   int ret = 0;
   uint32_t idx = -1;
   uint32_t len = 0;
 
-  ret = m_Reader.get((void *&)sample, idx, len, timeoutMs);
+  ret = m_Reader.get((void *&)sample, idx, len);
   if (0 == ret) {
     std::unique_lock<std::mutex> lck(m_Mutex);
     m_IdxMap[sample] = idx;

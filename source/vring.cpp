@@ -45,16 +45,16 @@ static std::string toAsName(std::string name) {
 }
 
 /* ================================ [ FUNCTIONS ] ============================================== */
-VRingBase::VRingBase(std::string name, uint32_t numDesc)
-  : m_Name(toAsName(name)), m_NumDesc(numDesc) {
+VRingBase::VRingBase(std::string uioId, std::string name, bool isIvshmem, uint32_t numDesc)
+  : m_uioId(uioId), m_Name(name), m_isIvshmem(isIvshmem), m_numDesc(numDesc) {
 }
 
 VRingBase::~VRingBase() {
 }
 
 uint32_t VRingBase::size() {
-  return VRING_SIZE_OF_META(m_NumDesc) + VRING_SIZE_OF_DESC(m_NumDesc) +
-         VRING_SIZE_OF_AVAIL(m_NumDesc) + VRING_SIZE_OF_ALL_USED(m_NumDesc);
+  return VRING_SIZE_OF_META(m_numDesc) + VRING_SIZE_OF_DESC(m_numDesc) +
+         VRING_SIZE_OF_AVAIL(m_numDesc) + VRING_SIZE_OF_ALL_USED(m_numDesc);
 }
 
 uint64_t VRingBase::timestamp() {
@@ -89,16 +89,21 @@ void VRingBase::spinUnlock(int32_t *pLock) {
   __atomic_store_n(pLock, 0, __ATOMIC_RELEASE);
 }
 
-VRingWriter::VRingWriter(std::string name, uint32_t msgSize, uint32_t numDesc)
-  : VRingBase(name, numDesc), m_MsgSize(msgSize) {
-  m_UsedSems.reserve(numDesc);
-  m_DmaMems.reserve(numDesc);
+VRingWriter::VRingWriter(std::string uioId, std::string name, bool isIvshmem, uint32_t numDesc, uint32_t msgSize)
+  : VRingBase(uioId, name, isIvshmem, numDesc), m_MsgSize(msgSize) {
 }
 
 int VRingWriter::init() {
   int ret = 0;
+  std::shared_ptr<SharedMemory> sharedMemory = nullptr;
 
-  auto sharedMemory = std::make_shared<SharedMemory>(m_Name, size());
+  if (m_isIvshmem) {
+    sharedMemory = std::make_shared<SharedMemory>(m_uioId);
+  }
+  else {
+    uint32_t shm_size = size();
+    sharedMemory = std::make_shared<SharedMemory>(m_Name, shm_size);
+  }
   if (nullptr == sharedMemory) {
     ret = ENOMEM;
   } else {
@@ -108,42 +113,17 @@ int VRingWriter::init() {
   if (0 == ret) {
     m_SharedMemory = sharedMemory;
     m_Meta = (VRing_MetaType *)m_SharedMemory->getVA();
-    m_Desc = (VRing_DescType *)(((uintptr_t)m_Meta) + VRING_SIZE_OF_META(m_NumDesc));
-    m_Avail = (VRing_AvailType *)(((uintptr_t)m_Desc) + VRING_SIZE_OF_DESC(m_NumDesc));
-    m_Used = (VRing_UsedType *)(((uintptr_t)m_Avail) + VRING_SIZE_OF_AVAIL(m_NumDesc));
+    m_Desc = (VRing_DescType *)(((uintptr_t)m_Meta) + VRING_SIZE_OF_META(m_numDesc));
+    m_Avail = (VRing_AvailType *)(((uintptr_t)m_Desc) + VRING_SIZE_OF_DESC(m_numDesc));
+    m_Used = (VRing_UsedType *)(((uintptr_t)m_Avail) + VRING_SIZE_OF_AVAIL(m_numDesc));
     ret = setup();
   } else {
     ASLOG(VRINGE, ("vring writer can't open shm %s\n", m_Name.c_str()));
   }
 
   if (0 == ret) {
-    m_SemAvail = std::make_shared<NamedSemaphore>(m_Name, m_NumDesc);
-    if (nullptr == m_SemAvail) {
-      ret = ENOMEM;
-    } else {
-      ret = m_SemAvail->create();
-    }
-  }
-
-  if (0 == ret) {
-    for (uint32_t i = 0; i < VRING_MAX_READERS; i++) {
-      std::string semName = m_Name + "_used" + std::to_string(i);
-      auto sem = std::make_shared<NamedSemaphore>(semName, 0);
-      if (nullptr == sem) {
-        ret = ENOMEM;
-      } else {
-        ret = sem->create();
-        if (0 == ret) {
-          m_UsedSems.push_back(sem);
-        }
-      }
-    }
-  }
-
-  if (0 == ret) {
     ASLOG(VRING, ("vring writer %s online: msgSize = %u,  numDesc = %u\n", m_Name.c_str(),
-                  m_MsgSize, m_NumDesc));
-    m_Thread = std::thread(&VRingWriter::threadMain, this);
+                  m_MsgSize, m_numDesc));
   }
 
   return ret;
@@ -155,10 +135,7 @@ VRingWriter::~VRingWriter() {
     m_Thread.join();
   }
 
-  m_SemAvail = nullptr;
-  m_UsedSems.clear();
   m_SharedMemory = nullptr;
-  m_DmaMems.clear();
 }
 
 int VRingWriter::setup() {
@@ -167,36 +144,19 @@ int VRingWriter::setup() {
 
   memset(m_SharedMemory->getVA(), 0, size());
   m_Meta->msgSize = m_MsgSize;
-  m_Meta->numDesc = m_NumDesc;
-  for (i = 0; (i < m_NumDesc) && (0 == ret); i++) {
-    std::string shmFile = m_Name + "_" + std::to_string(i) + "_" + std::to_string(m_MsgSize);
-    auto dmaMemory = std::make_shared<DmaMemory>(shmFile, m_MsgSize);
-    if (nullptr != dmaMemory) {
-      ret = dmaMemory->create();
-      if (0 == ret) {
-#ifdef USE_DMA_BUF
-        m_Desc[i].handle = dmaMemory->getHandle();
-#else
-        m_Desc[i].handle = i;
-#endif
+  m_Meta->numDesc = m_numDesc;
+  for (i = 0; i < m_numDesc; i++) {
         m_Desc[i].len = m_MsgSize;
         m_Avail->ring[i] = i;
         m_Avail->idx++;
-        m_DmaMems.push_back(dmaMemory);
-      }
-    } else {
-      ret = ENOMEM;
-    }
   }
 
   return ret;
 }
 
-int VRingWriter::get(void *&buf, uint32_t &idx, uint32_t &len, uint32_t timeoutMs) {
+int VRingWriter::get(void *&buf, uint32_t &idx, uint32_t &len) {
   int ret = 0;
   int32_t ref;
-
-  (void)m_SemAvail->wait(timeoutMs);
 
   ret = spinLock(&m_Avail->spin);
   if (0 == ret) {
@@ -204,10 +164,10 @@ int VRingWriter::get(void *&buf, uint32_t &idx, uint32_t &len, uint32_t timeoutM
       /* no buffers */
       ret = ENODATA;
     } else {
-      idx = m_Avail->ring[m_Avail->lastIdx % m_NumDesc];
-      ref = __atomic_load_n(&m_Desc[idx].ref, __ATOMIC_RELAXED);
+      idx = m_Avail->ring[m_Avail->lastIdx % m_numDesc];
+      ref = __atomic_load_n(&m_Desc[idx].ref, __ATOMIC_ACQUIRE);
       if (0 == ref) {
-        buf = m_DmaMems[idx]->getVA();
+        buf = m_Desc[idx].buffer;
         len = m_Desc[idx].len;
         m_Avail->lastIdx++;
         ASLOG(VRING, ("vring writer %s: get DESC[%u], len = %u; AVAIL: lastIdx = %u, idx = %u\n",
@@ -231,32 +191,28 @@ int VRingWriter::put(uint32_t idx, uint32_t len) {
   uint32_t i;
   bool isUSed = false;
   int ret = 0;
-  std::vector<uint32_t> readerIdxs;
-  readerIdxs.reserve(VRING_MAX_READERS);
 
-  if (idx > m_NumDesc) {
+  if (idx > m_numDesc) {
     ret = EINVAL;
   } else {
     ret = spinLock(&m_Desc[idx].spin);
     if (0 == ret) {
       m_Desc[idx].timestamp = timestamp();
       for (i = 0; i < VRING_MAX_READERS; i++) {
-        used = (VRing_UsedType *)(((uintptr_t)m_Used) + VRING_SIZE_OF_USED(m_NumDesc) * i);
-        /* state == 1, the used ring is in good status */
-        if (VRING_USED_STATE_READY == __atomic_load_n(&used->state, __ATOMIC_RELAXED)) {
-          usedElem = &used->ring[used->idx % m_NumDesc];
+        used = (VRing_UsedType *)(((uintptr_t)m_Used) + VRING_SIZE_OF_USED(m_numDesc) * i);
+         //if (VRING_USED_STATE_READY == __atomic_load_n(&used->state, __ATOMIC_ACQUIRE)) {
+          usedElem = &used->ring[used->idx % m_numDesc];
           usedElem->id = idx;
           usedElem->len = len;
-          __atomic_fetch_add(&m_Desc[idx].ref, 1, __ATOMIC_RELAXED);
+          __atomic_fetch_add(&m_Desc[idx].ref, 1, __ATOMIC_ACQ_REL);
           isUSed = true;
           ASLOG(VRING,
                 ("vring writer %s@%u: put DESC[%u], len = %u ref = %d; used: lastIdx = "
                  "%u, idx = %u\n",
-                 m_Name.c_str(), i, idx, len, __atomic_load_n(&m_Desc[idx].ref, __ATOMIC_RELAXED),
+                 m_Name.c_str(), i, idx, len, __atomic_load_n(&m_Desc[idx].ref, __ATOMIC_ACQUIRE),
                  used->lastIdx, used->idx));
           used->idx++;
-          readerIdxs.push_back(i);
-        }
+        //}
       }
       spinUnlock(&m_Desc[idx].spin);
     } else {
@@ -267,11 +223,7 @@ int VRingWriter::put(uint32_t idx, uint32_t len) {
       /* OK, put it back */
       (void)drop(idx);
       ret = ENOLINK;
-    } else {
-      for (auto i : readerIdxs) {
-        ret |= m_UsedSems[i]->post();
-      }
-    }
+    } 
   }
 
   return ret;
@@ -280,17 +232,17 @@ int VRingWriter::put(uint32_t idx, uint32_t len) {
 int VRingWriter::drop(uint32_t idx) {
   int ret = 0;
 
-  if (idx > m_NumDesc) {
+  if (idx > m_numDesc) {
     ret = EINVAL;
   } else {
+    ASLOG(INFO, ("drop===================m_avail === %p, idx = %d, lastidx = %d\n", &m_Avail, m_Avail->idx, m_Avail->lastIdx));
     ret = spinLock(&m_Avail->spin);
     if (0 == ret) {
-      m_Avail->ring[m_Avail->idx % m_NumDesc] = idx;
+      m_Avail->ring[m_Avail->idx % m_numDesc] = idx;
       m_Avail->idx++;
       spinUnlock(&m_Avail->spin);
       ASLOG(VRING, ("vring writer %s: drop DESC[%u]; AVAIL: lastIdx = %u, idx = %u\n",
                     m_Name.c_str(), idx, m_Avail->lastIdx, m_Avail->idx));
-      ret = m_SemAvail->post();
     } else {
       ASLOG(VRINGE, ("vring writer %s: drop lock AVAIL spin timeout\n", m_Name.c_str()));
     }
@@ -302,17 +254,16 @@ int VRingWriter::drop(uint32_t idx) {
 void VRingWriter::releaseDesc(uint32_t idx) {
   int32_t ref;
   int ret = 0;
-  ref = __atomic_sub_fetch(&m_Desc[idx].ref, 1, __ATOMIC_RELAXED);
+  ref = __atomic_sub_fetch(&m_Desc[idx].ref, 1, __ATOMIC_ACQ_REL);
   if (0 < ref) {
     /* still used by others */
   } else if (0 == ref) {
     ret = spinLock(&m_Avail->spin);
     if (0 == ret) {
-      m_Avail->ring[m_Avail->idx % m_NumDesc] = idx;
+      m_Avail->ring[m_Avail->idx % m_numDesc] = idx;
       m_Avail->idx++;
       spinUnlock(&m_Avail->spin);
       ASLOG(VRINGE, ("vring writer %s: release DESC[%u]\n", m_Name.c_str(), idx));
-      (void)m_SemAvail->post();
     } else {
       ASLOG(VRINGE, ("vring writer %s: release lock AVAIL spin timeout\n", m_Name.c_str()));
     }
@@ -322,88 +273,8 @@ void VRingWriter::releaseDesc(uint32_t idx) {
   }
 }
 
-void VRingWriter::removeAbnormalReader(VRing_UsedType *used, uint32_t readerIdx) {
-  VRing_UsedElemType *usedElem;
-  uint32_t ref;
-  uint32_t idx;
-  int ret = 0;
-
-  ASLOG(VRINGE, ("vring reader %s@%u is dead\n", m_Name.c_str(), readerIdx));
-  /* set ref > 1, mark as dead to stop the writer to put data on this used ring */
-  /* step 1: release the DESC in the reader used ring */
-  ref = __atomic_add_fetch(&used->state, 1, __ATOMIC_RELAXED);
-  assert(VRING_USED_STATE_KILLED == ref);
-  while (used->lastIdx != used->idx) {
-    usedElem = &used->ring[used->lastIdx % m_NumDesc];
-    idx = usedElem->id;
-    ret = spinLock(&m_Desc[idx].spin);
-    if (0 == ret) {
-      releaseDesc(idx);
-      spinUnlock(&m_Desc[idx].spin);
-    } else {
-      ASLOG(VRINGE,
-            ("vring writer %s: rm reader lock DESC[%u] spin timeout\n", m_Name.c_str(), idx));
-    }
-    used->lastIdx++;
-  }
-
-  ref = __atomic_sub_fetch(&used->state, VRING_USED_STATE_KILLED, __ATOMIC_RELAXED);
-  assert(VRING_USED_STATE_FREE == ref);
-}
-
-void VRingWriter::readerHeartCheck() {
-  VRing_UsedType *used;
-  uint32_t i;
-  uint32_t curHeart;
-  for (i = 0; i < VRING_MAX_READERS; i++) {
-    used = (VRing_UsedType *)(((uintptr_t)m_Used) + VRING_SIZE_OF_USED(m_NumDesc) * i);
-    if (VRING_USED_STATE_READY == __atomic_load_n(&used->state, __ATOMIC_RELAXED)) {
-      curHeart = __atomic_load_n(&used->heart, __ATOMIC_RELAXED);
-      if (curHeart == used->lastHeart) { /* the reader is dead or stuck */
-        removeAbnormalReader(used, i);
-      } else {
-        used->lastHeart = curHeart;
-      }
-    }
-  }
-}
-
-void VRingWriter::checkDescLife() {
-  uint64_t elapsed;
-  uint32_t idx;
-  int32_t ref;
-  int ret = 0;
-
-  for (idx = 0; idx < m_NumDesc; idx++) {
-    ret = spinLock(&m_Desc[idx].spin);
-    if (0 == ret) {
-      ref = __atomic_load_n(&m_Desc[idx].ref, __ATOMIC_RELAXED);
-      if (ref > 0) {
-        elapsed = timestamp() - m_Desc[idx].timestamp;
-        if (elapsed > VRING_DESC_TIMEOUT) {
-          ASLOG(VRINGE, ("vring writer %s: DESC %u ref = %d timeout\n", m_Name.c_str(), idx, ref));
-          /* TODO: this is not right to do the release, it's FATAL APP's bug */
-          releaseDesc(idx);
-        }
-      }
-      spinUnlock(&m_Desc[idx].spin);
-    } else {
-      ASLOG(VRINGE,
-            ("vring writer %s: check DESC life lock DESC[%u] spin timeout\n", m_Name.c_str(), idx));
-    }
-  }
-}
-
-void VRingWriter::threadMain() {
-  while (false == m_Stop) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(500));
-    readerHeartCheck();
-    checkDescLife();
-  }
-}
-
-VRingReader::VRingReader(std::string name, uint32_t numDesc) : VRingBase(name, numDesc) {
-  m_DmaMems.reserve(numDesc);
+VRingReader::VRingReader(std::string uioId, std::string name, bool isIvshmem, uint32_t numDesc) 
+  : VRingBase(uioId, name, isIvshmem, numDesc) {
 }
 
 int VRingReader::init() {
@@ -412,7 +283,15 @@ int VRingReader::init() {
   int32_t ref;
   int ret = 0;
 
-  auto sharedMemory = std::make_shared<SharedMemory>(m_Name, 0, size());
+  std::shared_ptr<SharedMemory> sharedMemory = nullptr;
+
+  if (m_isIvshmem) {
+    sharedMemory = std::make_shared<SharedMemory>(m_uioId);
+  }
+  else {
+    sharedMemory = std::make_shared<SharedMemory>(m_Name, size());
+  }
+
   if (nullptr == sharedMemory) {
     ret = ENOMEM;
   } else {
@@ -422,26 +301,28 @@ int VRingReader::init() {
   if (0 == ret) {
     m_SharedMemory = sharedMemory;
     m_Meta = (VRing_MetaType *)m_SharedMemory->getVA();
-    assert(m_Meta->numDesc == m_NumDesc);
-    m_Desc = (VRing_DescType *)(((uintptr_t)m_Meta) + VRING_SIZE_OF_META(m_NumDesc));
-    m_Avail = (VRing_AvailType *)(((uintptr_t)m_Desc) + VRING_SIZE_OF_DESC(m_NumDesc));
-    used = (VRing_UsedType *)(((uintptr_t)m_Avail) + VRING_SIZE_OF_AVAIL(m_NumDesc));
+    assert(m_Meta->numDesc == m_numDesc);
+    m_Desc = (VRing_DescType *)(((uintptr_t)m_Meta) + VRING_SIZE_OF_META(m_numDesc));
+    m_Avail = (VRing_AvailType *)(((uintptr_t)m_Desc) + VRING_SIZE_OF_DESC(m_numDesc));
+    used = (VRing_UsedType *)(((uintptr_t)m_Avail) + VRING_SIZE_OF_AVAIL(m_numDesc));
     for (i = 0; i < VRING_MAX_READERS; i++) {
-      if (VRING_USED_STATE_FREE == __atomic_load_n(&used->state, __ATOMIC_RELAXED)) {
-        ref = __atomic_fetch_add(&used->state, 1, __ATOMIC_RELAXED);
+      if (VRING_USED_STATE_FREE == __atomic_load_n(&used->state, __ATOMIC_ACQUIRE)) {
+        ref = __atomic_fetch_add(&used->state, 1, __ATOMIC_ACQUIRE);
         if (VRING_USED_STATE_FREE == ref) {
           m_ReaderIdx = i;
           m_Used = used;
-          __atomic_fetch_add(&m_Used->heart, 1, __ATOMIC_RELAXED);
-          ref = __atomic_add_fetch(&m_Used->state, 1, __ATOMIC_RELAXED);
+          std::atomic_thread_fence(std::memory_order_release);  // ????
+          ref = __atomic_add_fetch(&m_Used->state, 1, __ATOMIC_ACQ_REL);
           assert(VRING_USED_STATE_READY == ref);
+          ASLOG(INFO, ("reader is ready!\n"));
+
           break;
         } else {
           ASLOG(VRING, ("vring reader %s: race on %u\n", m_Name.c_str(), i));
-          __atomic_fetch_sub(&used->state, 1, __ATOMIC_RELAXED);
+          __atomic_fetch_sub(&used->state, 1, __ATOMIC_ACQ_REL);
         }
       }
-      used = (VRing_UsedType *)(((uintptr_t)used) + VRING_SIZE_OF_USED(m_NumDesc));
+      used = (VRing_UsedType *)(((uintptr_t)used) + VRING_SIZE_OF_USED(m_numDesc));
     }
 
     if (nullptr == m_Used) {
@@ -453,41 +334,8 @@ int VRingReader::init() {
   }
 
   if (0 == ret) {
-    std::string semName = m_Name + "_used" + std::to_string(m_ReaderIdx);
-    m_SemUsed = std::make_shared<NamedSemaphore>(semName);
-    if (nullptr == m_SemUsed) {
-      ret = ENOMEM;
-    } else {
-      ret = m_SemUsed->create();
-    }
-  }
-
-  if (0 == ret) {
-    m_SemAvail = std::make_shared<NamedSemaphore>(m_Name);
-    if (nullptr == m_SemAvail) {
-      ret = ENOMEM;
-    } else {
-      ret = m_SemAvail->create();
-    }
-  }
-
-  for (i = 0; (i < m_NumDesc) && (0 == ret); i++) {
-    std::string shmFile = m_Name + "_" + std::to_string(i) + "_" + std::to_string(m_Desc[i].len);
-    auto dmaMemory = std::make_shared<DmaMemory>(shmFile, m_Desc[i].handle, m_Desc[i].len);
-    if (nullptr != dmaMemory) {
-      ret = dmaMemory->create();
-      if (0 == ret) {
-        m_DmaMems.push_back(dmaMemory);
-      }
-    } else {
-      ret = ENOMEM;
-    }
-  }
-
-  if (0 == ret) {
     ASLOG(VRINGI, ("vring reader %s@%u online: msgSize = %u,  numDesc = %u\n", m_Name.c_str(),
-                   m_ReaderIdx, m_Meta->msgSize, m_NumDesc));
-    m_Thread = std::thread(&VRingReader::threadMain, this);
+                   m_ReaderIdx, m_Meta->msgSize, m_numDesc));
   }
 
   return ret;
@@ -506,16 +354,17 @@ VRingReader::~VRingReader() {
   }
 
   if (nullptr != m_Used) {
-    ref = __atomic_load_n(&m_Used->state, __ATOMIC_RELAXED);
+    ref = __atomic_load_n(&m_Used->state, __ATOMIC_ACQUIRE);
     if (VRING_USED_STATE_READY == ref) {
-      ret = get(addr, idx, len, 0);
+      ret = get(addr, idx, len);
       while (0 == ret) {
         (void)put(idx);
-        ret = get(addr, idx, len, 0);
+        ret = get(addr, idx, len);
         ASLOG(VRINGI, ("vring reader %s@%u, release unconsumed buffer at %u\n", m_Name.c_str(),
                        m_ReaderIdx, idx));
       }
-      __atomic_sub_fetch(&m_Used->state, VRING_USED_STATE_READY, __ATOMIC_RELAXED);
+      __atomic_sub_fetch(&m_Used->state, VRING_USED_STATE_READY, __ATOMIC_ACQ_REL);
+        ASLOG(INFO, ("sub ====== 3\n"));
       ASLOG(VRINGI, ("vring reader %s@%u clear up\n", m_Name.c_str(), m_ReaderIdx));
     } else {
       ASLOG(VRINGE, ("vring reader %s@%u killed\n", m_Name.c_str(), m_ReaderIdx));
@@ -523,31 +372,25 @@ VRingReader::~VRingReader() {
   }
 
   m_SharedMemory = nullptr;
-  m_DmaMems.clear();
-
-  m_SemAvail = nullptr;
-  m_SemUsed = nullptr;
 }
 
-int VRingReader::get(void *&buf, uint32_t &idx, uint32_t &len, uint32_t timeoutMs) {
+int VRingReader::get(void *&buf, uint32_t &idx, uint32_t &len) {
   VRing_UsedElemType *used;
   int ret = 0;
 
-  (void)m_SemUsed->wait(timeoutMs);
-
-  if (VRING_USED_STATE_READY != __atomic_load_n(&m_Used->state, __ATOMIC_RELAXED)) {
-    ASLOG(VRINGE, ("vring reader %s@%u get killed by writer\n", m_Name.c_str(), m_ReaderIdx));
+  if (VRING_USED_STATE_READY != __atomic_load_n(&m_Used->state, __ATOMIC_ACQUIRE)) {
+    ASLOG(VRINGE, ("vring reader %s@%u get killed by writer, state = %d\n", m_Name.c_str(), m_ReaderIdx, m_Used->state));
     ret = EBADF; /* killed by the Writer */
   } else if (m_Used->lastIdx == m_Used->idx) {
     /* no used buffer available */
     ret = ENOMSG;
   } else {
-    used = &m_Used->ring[m_Used->lastIdx % m_NumDesc];
+    used = &m_Used->ring[m_Used->lastIdx % m_numDesc];
     idx = used->id;
     len = used->len;
     m_Used->lastIdx++;
 
-    buf = m_DmaMems[idx]->getVA();
+    buf = m_Desc[idx].buffer;
 
     /* if the app crashed after this before call the put, then the desc is in detached state
      * that need the monitor to recycle it.
@@ -560,28 +403,26 @@ int VRingReader::get(void *&buf, uint32_t &idx, uint32_t &len, uint32_t timeoutM
 int VRingReader::put(uint32_t idx) {
   int32_t ref;
   int ret = 0;
-  bool doSemPost = false;
 
-  if (VRING_USED_STATE_READY != __atomic_load_n(&m_Used->state, __ATOMIC_RELAXED)) {
+  if (VRING_USED_STATE_READY != __atomic_load_n(&m_Used->state, __ATOMIC_ACQUIRE)) {
     ret = EBADF; /* killed by the Writer */
     ASLOG(VRINGE, ("vring reader %s@%u put killed by writer\n", m_Name.c_str(), m_ReaderIdx));
-  } else if (idx > m_NumDesc) {
+  } else if (idx > m_numDesc) {
     ret = EINVAL;
   } else {
     ret = spinLock(&m_Desc[idx].spin);
     if (0 == ret) {
-      ref = __atomic_sub_fetch(&m_Desc[idx].ref, 1, __ATOMIC_RELAXED);
+      ref = __atomic_sub_fetch(&m_Desc[idx].ref, 1, __ATOMIC_ACQ_REL);
       if (0 < ref) {
         /* still used by others */
       } else if (0 == ref) {
         ret = spinLock(&m_Avail->spin);
         if (0 == ret) {
-          m_Avail->ring[m_Avail->idx % m_NumDesc] = idx;
+          m_Avail->ring[m_Avail->idx % m_numDesc] = idx;
           ASLOG(VRING, ("vring reader %s@%u: put DESC[%u]; AVAIL: lastIdx = %u, idx = %u\n",
                         m_Name.c_str(), m_ReaderIdx, idx, m_Avail->lastIdx, m_Avail->idx));
           m_Avail->idx++;
           spinUnlock(&m_Avail->spin);
-          doSemPost = true;
         } else {
           ASLOG(VRINGE, ("vring reader %s: put lock AVAIL spin timeout\n", m_Name.c_str(), idx));
         }
@@ -596,19 +437,9 @@ int VRingReader::put(uint32_t idx) {
       ASLOG(VRINGE, ("vring reader %s: put lock DESC[%u] spin timeout\n", m_Name.c_str(), idx));
     }
 
-    if (doSemPost) {
-      ret = m_SemAvail->post();
-    }
   }
 
   return ret;
-}
-
-void VRingReader::threadMain() {
-  while (false == m_Stop) {
-    __atomic_fetch_add(&m_Used->heart, 1, __ATOMIC_RELAXED);
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
-  }
 }
 
 } // namespace vdds

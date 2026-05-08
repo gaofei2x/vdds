@@ -15,17 +15,16 @@ namespace vdds {
 /* ================================ [ TYPES     ] ============================================== */
 typedef enum {
   MEMORY_TYPE_ALLOC,
-  MEMORY_TYPE_MMAP
+  MEMORY_TYPE_MMAP,
+  MEMORY_TYPE_IVSHMEM
 } MemoryType_t;
 
 class SharedMemory {
 public:
+
+  SharedMemory(std::string uioId);
   /* This constructor will create a shared memory */
   SharedMemory(std::string name, uint32_t size);
-
-  /* This constructor will open an existed shared memory, handle can be any value, the handle is
-   * just there as to be API compatible with DmaMemory */
-  SharedMemory(std::string name, uint64_t handle, uint32_t size);
 
   ~SharedMemory();
 
@@ -40,12 +39,17 @@ public:
     return m_Addr;
   }
 
-  uint32_t getSize() {
-    return m_Size;
-  }
+  uint32_t getSize();
+
 
 private:
+  std::string uio_DeviceFile;
+  std::string uio_ResourceFile;
+  std::string uio_Resource2wcFile;
+  std::string uio_ConfigFile;
+  std::string uio_doorbellFile;
   std::string m_Name;
+  std::string m_uioId;
   uint64_t m_Handle = 0;
   uint32_t m_Size = 0;
   MemoryType_t m_Type;

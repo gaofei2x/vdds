@@ -19,21 +19,20 @@ namespace vdds {
 /* ================================ [ TYPES     ] ============================================== */
 typedef struct PublisherOptions {
 public:
-  PublisherOptions(uint32_t queueDepth = 8) : queueDepth(queueDepth) {
-  }
-
-public:
-  uint32_t queueDepth = 8;
+  uint32_t queueDepth = 1;
+  std::string uioId;
+  std::string name;
+  bool isIvshmem = false;  // true for publisher (creates shm), false for subscriber
 } PublisherOptions_t;
 
 template <typename T> class Publisher {
 public:
-  Publisher(std::string topicName, const PublisherOptions_t &publisherOptions = PublisherOptions());
+  Publisher(const PublisherOptions_t &options);
   ~Publisher();
 
   int init();
 
-  int load(T *&sample, uint32_t timeoutMs = 1000);
+  int load(T *&sample);
   int publish(T *sample);
   int publish(T *sample, size_t size);
 
@@ -51,8 +50,8 @@ private:
 /* ================================ [ LOCALS    ] ============================================== */
 /* ================================ [ FUNCTIONS ] ============================================== */
 template <typename T>
-Publisher<T>::Publisher(std::string topicName, const PublisherOptions_t &publisherOptions)
-  : m_TopicName(topicName), m_Writer(topicName, sizeof(T), publisherOptions.queueDepth) {
+Publisher<T>::Publisher(const PublisherOptions_t &options)
+  : m_Writer(options.uioId, options.name, options.isIvshmem, options.queueDepth, sizeof(T)) {
 }
 
 template <typename T> Publisher<T>::~Publisher() {
@@ -62,12 +61,12 @@ template <typename T> int Publisher<T>::init() {
   return m_Writer.init();
 }
 
-template <typename T> int Publisher<T>::load(T *&sample, uint32_t timeoutMs) {
+template <typename T> int Publisher<T>::load(T *&sample) {
   uint32_t idx;
   uint32_t len;
   int ret = 0;
 
-  ret = m_Writer.get((void *&)sample, idx, len, timeoutMs);
+  ret = m_Writer.get((void *&)sample, idx, len);
   if (0 == ret) {
     std::unique_lock<std::mutex> lck(m_Mutex);
     m_IdxMap[sample] = idx;
