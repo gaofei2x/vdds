@@ -33,19 +33,19 @@ namespace vdds {
 
 #define VRING_ALIGN(sz) (((sz) + (VRING_ALIGNMENT)-1) & (~((VRING_ALIGNMENT)-1)))
 
-#define VRING_SIZE_OF_META(numDesc) VRING_ALIGN(sizeof(VRing_MetaType) * numDesc)
+#define VRING_SIZE_OF_META(numDesc) VRING_ALIGN(sizeof(VRing_MetaType))
 
 #define VRING_SIZE_OF_DESC(numDesc)                                                                \
-  VRING_ALIGN((sizeof(VRing_DescType) + sizeof(uint32_t) * numDesc) * numDesc)
+  VRING_ALIGN((sizeof(VRing_DescType) * numDesc))
 
 #define VRING_SIZE_OF_AVAIL(numDesc)                                                               \
-  VRING_ALIGN((sizeof(VRing_AvailType) + sizeof(uint32_t) * numDesc) * numDesc)
+  VRING_ALIGN(sizeof(VRing_AvailType) + sizeof(uint32_t) * numDesc)
 
 #define VRING_SIZE_OF_USED(numDesc)                                                                \
-  VRING_ALIGN((sizeof(VRing_UsedType) + sizeof(VRing_UsedElemType) * numDesc) * numDesc)
+  VRING_ALIGN(sizeof(VRing_UsedType) + sizeof(VRing_UsedElemType) * numDesc)
 
 #define VRING_SIZE_OF_ALL_USED(numDesc)                                                            \
-  (VRING_ALIGN((sizeof(VRing_UsedType) + sizeof(VRing_UsedElemType) * numDesc) * numDesc) *        \
+  (VRING_ALIGN(sizeof(VRing_UsedType) + sizeof(VRing_UsedElemType) * numDesc)  *        \
    VRING_MAX_READERS)
 
 #define VRING_USED_STATE_FREE 0
@@ -60,16 +60,14 @@ typedef struct {
 } VRing_MetaType;
 
 typedef struct {
+  int32_t ref __attribute__((aligned(64))); 
   uint64_t timestamp; /* timestamp in microseconds when publish this DESC */
-  char buffer[50 * 1024 * 1024];    /* the virtual shared large memory handle */
+  uintptr_t buffer;    /* the virtual shared large memory handle */
   uint32_t len;
-  int32_t spin; /* The spinlock to protect the ref and timestamp */
-  int32_t ref;  /* The reference counter */
 } VRing_DescType;
 
 typedef struct {
   uint32_t lastIdx;
-  int32_t spin; /* The spinlock to ensure the idx and ring content updated atomic */
   uint32_t idx;
   uint32_t ring[];
 } VRing_AvailType;
@@ -88,7 +86,8 @@ typedef struct {
 
 class VRingBase {
 public:
-  VRingBase(std::string uioId, std::string name, bool isIvshmem, uint32_t numDesc);
+  VRingBase(std::string uioId, std::string name, bool isIvshmem, uint32_t numDesc, size_t msgSize);
+
   ~VRingBase();
 
   uint64_t timestamp();
@@ -103,6 +102,7 @@ protected:
   std::string m_Name;
   bool m_isIvshmem;
   uint32_t m_numDesc;
+  size_t m_MsgSize;
 
   VRing_MetaType *m_Meta = nullptr;
   VRing_DescType *m_Desc = nullptr;
@@ -115,7 +115,7 @@ protected:
 /*The Virtio Ring Writer*/
 class VRingWriter : public VRingBase {
 public:
-  VRingWriter(std::string uioId, std::string name, bool isIvshmem, uint32_t numDesc, uint32_t msgSize);
+  VRingWriter(std::string uioId, std::string name, bool isIvshmem, uint32_t numDesc, size_t msgSize);
   ~VRingWriter();
 
   int init();
@@ -133,10 +133,8 @@ public:
 
 private:
   int setup();
-  void releaseDesc(uint32_t idx);
 
 private:
-  uint32_t m_MsgSize; /* the size for each message */
   bool m_Stop = false;
   std::thread m_Thread;
 
@@ -144,7 +142,7 @@ private:
 
 class VRingReader : public VRingBase {
 public:
-  VRingReader(std::string uioId, std::string name, bool isIvshmem, uint32_t numDesc);
+  VRingReader(std::string uioId, std::string name, bool isIvshmem, uint32_t numDesc, size_t msgSize);
   ~VRingReader();
 
   int init();

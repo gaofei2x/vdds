@@ -20,6 +20,7 @@ namespace vdds {
 typedef struct PublisherOptions {
 public:
   uint32_t queueDepth = 1;
+  size_t msgSize = 0;
   std::string uioId;
   std::string name;
   bool isIvshmem = false;  // true for publisher (creates shm), false for subscriber
@@ -33,11 +34,11 @@ public:
   int init();
 
   int load(T *&sample);
-  int publish(T *sample);
   int publish(T *sample, size_t size);
 
   // API for debug purpose
   uint32_t idx(T *sample);
+  int drop(T *sample); 
 
 private:
   std::string m_TopicName;
@@ -51,7 +52,7 @@ private:
 /* ================================ [ FUNCTIONS ] ============================================== */
 template <typename T>
 Publisher<T>::Publisher(const PublisherOptions_t &options)
-  : m_Writer(options.uioId, options.name, options.isIvshmem, options.queueDepth, sizeof(T)) {
+  : m_Writer(options.uioId, options.name, options.isIvshmem, options.queueDepth, options.msgSize) {
 }
 
 template <typename T> Publisher<T>::~Publisher() {
@@ -68,25 +69,7 @@ template <typename T> int Publisher<T>::load(T *&sample) {
 
   ret = m_Writer.get((void *&)sample, idx, len);
   if (0 == ret) {
-    std::unique_lock<std::mutex> lck(m_Mutex);
     m_IdxMap[sample] = idx;
-  }
-
-  return ret;
-}
-
-template <typename T> int Publisher<T>::publish(T *sample) {
-  int ret = 0;
-  uint32_t idx;
-
-  std::unique_lock<std::mutex> lck(m_Mutex);
-  auto it = m_IdxMap.find(sample);
-  if (it != m_IdxMap.end()) {
-    idx = it->second;
-    ret = m_Writer.put(idx, sizeof(T));
-  } else {
-    ASLOG(VPUBE, ("%s: invalid sample\n", m_TopicName.c_str()));
-    ret = EINVAL;
   }
 
   return ret;
@@ -96,14 +79,13 @@ template <typename T> int Publisher<T>::publish(T *sample, size_t size) {
   int ret = 0;
   uint32_t idx;
 
-  std::unique_lock<std::mutex> lck(m_Mutex);
   auto it = m_IdxMap.find(sample);
   if (it != m_IdxMap.end()) {
     idx = it->second;
-    m_IdxMap.erase(it);
-    m_Writer.put(idx, (uint32_t)size);
+    //m_IdxMap.erase(it);
+    ret = m_Writer.put(idx, (uint32_t)size);
   } else {
-    ASLOG(VPUBE, ("%s: invalid sample\n", m_TopicName.c_str()));
+    ASLOG(VPUBE, ("%s: 111invalid sample\n", m_TopicName.c_str()));
     ret = EINVAL;
   }
 
@@ -117,10 +99,29 @@ template <typename T> uint32_t Publisher<T>::idx(T *sample) {
   if (it != m_IdxMap.end()) {
     idx_ = it->second;
   } else {
-    ASLOG(VPUBE, ("%s: invalid sample\n", m_TopicName.c_str()));
+    ASLOG(VPUBE, ("%s: 222invalid sample\n", m_TopicName.c_str()));
   }
 
   return idx_;
+}
+
+template <typename T> 
+int Publisher<T>::drop(T *sample) {
+  if (sample == nullptr) return EINVAL;
+
+  auto it = m_IdxMap.find(sample);
+  if (it != m_IdxMap.end()) {
+    uint32_t idx = it->second;
+    
+    // 1. 从管理 Map 中擦除它，防止内存泄漏
+    m_IdxMap.erase(it);
+    
+    // 2. 归还底层缓冲区
+    return m_Writer.drop(idx);
+  } else {
+    ASLOG(VPUBE, ("%s: invalid sample to drop\n", m_TopicName.c_str()));
+    return EINVAL;
+  }
 }
 
 } // namespace vdds
